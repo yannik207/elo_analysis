@@ -1,0 +1,299 @@
+#!/usr/bin/env python3.11
+
+from datetime import datetime, date
+import json
+import numpy as np
+import os
+import pandas as pd
+import psycopg2
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+# connection to database to read
+class DB_Maintainer_reader:
+    def _establish_connection(self):
+        #   db_access_dict = json.load(f)
+        HOST = os.getenv("SQL_HOST")
+        DATABASE = os.getenv("SQL_DB_NAME_READER")
+        USER = os.getenv("SQL_USERNAME")
+        PASSWORD = os.getenv("SQL_PASSWORD")
+        PORT = os.getenv("SQL_PORT")
+
+        conn = psycopg2.connect(host=HOST, database=DATABASE, user=USER, password=PASSWORD, port=PORT)
+        return conn
+
+    @classmethod
+    def execute_sql(self, sql: str, values: tuple = None):
+        conn = self._establish_connection(self)
+        cursor = conn.cursor()
+        cursor.execute(query=sql, vars=values)
+
+        results = []
+        # applied a select of true
+        if cursor.description:
+            columns = [column[0] for column in cursor.description]
+            for row in cursor.fetchall():
+                results.append(dict(zip(columns, row)))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return results
+
+# query for portrait decision
+SQL = f"""
+SELECT dt_finished_rating AS dt_rated
+    , user_usercandidaterelationship.id AS portrait_id
+    , me_id AS user_id
+    , CASE WHEN final_decision = 0 THEN 100 ELSE 0 END AS rating
+FROM user_usercandidaterelationship
+WHERE dt_finished_rating IS NOT NULL
+"""
+portrait_decision = DB_Maintainer_reader.execute_sql(SQL)
+
+portrait_decision = list(filter(lambda d: datetime.date(d['dt_rated']) > date(year=2021, month=12, day=28), portrait_decision))
+
+# query user base
+SQL = f"""
+SELECT user_user.id AS user_id
+    , user_user.uuid
+    , has_minimal_profile AS activated
+    , 1 AS count_of_elements
+    , 1500 AS element_type_elo
+    , 0 AS behavioral_elo_delta
+    , 0 AS sum_of_percentages
+    , 0 AS action_count
+FROM user_user
+
+"""
+elo_portrait_aggregate_data = DB_Maintainer_reader.execute_sql(SQL)
+
+# query relationship between users
+SQL = f"""
+    SELECT
+    user_usercandidaterelationship.id AS portrait_id
+        , candidate_id AS user_id
+        , 1500 AS elo
+    FROM user_usercandidaterelationship
+"""
+elo_portrait_data = DB_Maintainer_reader.execute_sql(SQL)
+
+# product decision exclusion reasons
+SQL = f"""
+WITH last_dt_closed_user AS(
+        SELECT user_id
+                , MAX(dt_closed) AS last_dt_closed
+        FROM user_userprofileverification
+            GROUP BY user_id
+    )
+
+    , user_was_rated AS(
+        SELECT candidate_id
+                , COUNT(id) AS received_ratings
+        FROM user_usercandidaterelationship
+        WHERE dt_finished_rating IS NOT NULL
+        GROUP BY candidate_id)
+
+    , user_rated AS(
+        SELECT me_id
+                , COUNT(id) AS given_ratings
+        FROM user_usercandidaterelationship
+        WHERE dt_finished_rating IS NOT NULL
+        GROUP BY me_id)
+
+    SELECT user_user.id AS user_id
+            , CASE WHEN status = 2 THEN true ELSE false END AS user_blocked
+            , CASE WHEN deleted_at IS NOT NULL THEN true ELSE false END AS user_deleted
+            , CASE WHEN given_ratings IS NULL THEN 0 ELSE received_ratings END AS given_ratings
+            , CASE WHEN received_ratings IS NULL THEN 0 ELSE received_ratings END AS received_ratings
+            , CASE WHEN optic_elo_class = 0 THEN true ELSE false END AS drop_due_to_maurice
+    FROM user_user
+        LEFT JOIN last_dt_closed_user
+            ON last_dt_closed_user.user_id = user_user.id
+        LEFT JOIN user_userprofileverification
+            ON user_userprofileverification.user_id = last_dt_closed_user.user_id
+            and user_userprofileverification.dt_closed = last_dt_closed_user.last_dt_closed
+        LEFT JOIN user_rated
+            ON user_rated.me_id = user_user.id
+        LEFT JOIN user_was_rated
+            ON user_was_rated.candidate_id = user_user.id
+    GROUP BY user_user.id
+            , status
+            , deleted_at
+            , received_ratings
+            , given_ratings
+"""
+exclusion_reason_df = pd.DataFrame(DB_Maintainer_reader.execute_sql(SQL))
+
+# PARAMETER EXPLANATION
+# scaling_factor_ELO: determines how rating differences are translated into expected results; higher values --> lower expectation
+# scaling_factor_MOV: determines how rating differences are translated into expected margins; higher values --> lower expectation
+# adjustment_factor_ELO: maximum ELO rating change due to ELO based on one user action
+# adjustment_factor_MOV: maximum ELO rating change due to MOV based on one user action
+
+scaling_factor_ELO = 400  # 400 # determines how rating differences are translated into expected results; higher values --> lower expectation
+scaling_factor_MOV = 500  # 500 # determines how rating differences are translated into expected margins; higher values --> lower expectation
+adjustment_factor_ELO = 8  # 8 # maximum ELO rating change due to ELO based on one user action
+adjustment_factor_MOV = 8  # 8 # maximum ELO rating change due to MOV based on one user action
+
+# DEFINE ELO UPDATE FUNCTION (including margin of victory)
+def update_ELO_MOV(old_rating_item, rating_user_who_rates, decision_percentage, verbosity=False):
+    match_result = 0
+    if decision_percentage > 60:
+        match_result = 1
+    elif decision_percentage > 40:
+        match_result = 0.5
+    expected_result = 10 ** (old_rating_item / scaling_factor_ELO) / (
+            10 ** (old_rating_item / scaling_factor_ELO) + 10 ** (rating_user_who_rates / scaling_factor_ELO))
+    # DEFINE MOV
+    expected_margin_of_victory = (old_rating_item - rating_user_who_rates) / scaling_factor_MOV
+    # ENSURE THAT EXPECTED MOV IS WITHIN [-1,1]
+    if expected_margin_of_victory > 1:
+        expected_margin_of_victory = 1
+    if expected_margin_of_victory < -1:
+        expected_margin_of_victory = -1
+    # TRANSLATE EXPECTED MOV INTO SCALING COMPARABLE TO decision_percentage
+    expected_margin_of_victory = 50 + expected_margin_of_victory * 50
+    if verbosity == True: print("expected result: ", expected_result, "; actual result: ", [match_result],
+                                "; delta from ELO: ", adjustment_factor_ELO * (match_result - expected_result))
+    if verbosity == True: print("expected MOV: ", expected_margin_of_victory, "; actual MOV: ", [decision_percentage],
+                                "; delta from MOV: ",
+                                adjustment_factor_MOV / 100 * (decision_percentage - expected_margin_of_victory))
+    new_rating = old_rating_item + adjustment_factor_ELO * (
+            match_result - expected_result) + adjustment_factor_MOV / 100 * (
+                         decision_percentage - expected_margin_of_victory)
+    return new_rating
+
+def update_elo_scores(elo_status_data, element_decisions, element_elos, relevant_id):
+    for row in element_decisions:
+        # clarify usage; at the moment, we don't save decisions of deleted users nor do we have deleted users data in our user db
+        # deleted_user = False
+        # get element type elo of rating user
+        element_type_elo_of_rating_user = [user['element_type_elo'] for user in elo_status_data if
+                                           user['user_id'] == row['user_id']]
+        assert (len(element_type_elo_of_rating_user) == 1)
+        # turn elo from single value list to int value
+        curr_element_type_elo_of_rating_user = element_type_elo_of_rating_user[0]
+
+        # get current elo and user_id of rated element
+        curr_element = [element for element in element_elos if element[relevant_id] == row[relevant_id]]
+        if len(curr_element) == 1:
+            curr_element = curr_element[0]
+            curr_element_elo = curr_element['elo']
+
+            rated_user_id = curr_element['user_id']
+            rating_user_id = row['user_id']
+
+            decision_percentage = row['rating']
+
+            updated_element_elo = update_ELO_MOV(
+                old_rating_item=curr_element_elo,
+                rating_user_who_rates=curr_element_type_elo_of_rating_user,
+                decision_percentage=decision_percentage
+            )
+
+            # update element elo in list of dicts
+            for element in element_elos:
+                if element[relevant_id] == row[relevant_id]:
+                    element['elo'] = updated_element_elo
+
+            # update element type elo of rated user and rating user
+            updated_rated_user = False
+            updated_rating_user = False
+
+            for entry in elo_status_data:
+                if entry['user_id'] == rated_user_id:
+                    # starting user elo + (new_item_elo - initial_item_elo) /  len of items
+                    starting_elo_rated_user = entry['element_type_elo']
+                    count_of_elements = entry['count_of_elements']
+                    elo_distance = updated_element_elo - curr_element_elo
+                    entry['element_type_elo'] = starting_elo_rated_user + (elo_distance / count_of_elements)
+                    updated_rated_user = True
+            for entry in elo_status_data:
+                if entry['user_id'] == rating_user_id:
+                    # update rating user only, if active
+                    if entry['activated']:
+                        # starting user elo - (new_item_elo - initial_item_elo) /  len of items
+                        starting_elo_rating_user = entry['element_type_elo']
+                        starting_behavioral_delta_user = entry['behavioral_elo_delta']
+                        starting_action_count = entry['action_count']
+                        starting_sum_of_percentages = entry['sum_of_percentages']
+
+                        elo_distance = updated_element_elo - curr_element_elo
+                        entry['element_type_elo'] = starting_elo_rating_user - (elo_distance / count_of_elements)
+                        # behavioral delta only gets updated through own actions
+                        entry['behavioral_elo_delta'] = starting_behavioral_delta_user - (
+                                elo_distance / count_of_elements)
+                        entry['action_count'] = starting_action_count + 1
+                        entry['sum_of_percentages'] = starting_sum_of_percentages + decision_percentage
+                    updated_rating_user = True
+            assert (updated_rated_user)
+            assert (updated_rating_user)
+
+    return [elo_status_data]
+
+
+# apply ELO calculation to all element types seperately
+
+# PORTRAIT
+# adjust elo score data based on past ratings
+portrait_elo_status_data = update_elo_scores(
+    elo_status_data=elo_portrait_aggregate_data,
+    element_decisions=portrait_decision,
+    element_elos=elo_portrait_data,
+    relevant_id="portrait_id"
+)
+
+portrait_elo_status_data_df = pd.DataFrame(portrait_elo_status_data[0])
+# join data for exclude use
+portrait_elo_status_data_df = portrait_elo_status_data_df.merge(exclusion_reason_df, on=['user_id'], how='left')
+
+# only keep all users who are not deleted, not blocked and have more than 50 ratings received and given
+portrait_elo_status_data_df = portrait_elo_status_data_df[(portrait_elo_status_data_df['user_deleted'] == False)
+                                                          & (portrait_elo_status_data_df['user_blocked'] == False)
+                                                          & (portrait_elo_status_data_df['received_ratings'] >= 10)
+                                                          & (portrait_elo_status_data_df['given_ratings'] >= 10)
+                                                          & (portrait_elo_status_data_df['drop_due_to_maurice'] == False)]
+
+portrait_elo_status_data_df = portrait_elo_status_data_df.sort_values(['element_type_elo'], ascending=True)
+# don't use the optic elo class 0 because it is manually used for not showing the particular user
+portrait_elo_status_data_df['elo_class'] = pd.cut(portrait_elo_status_data_df['element_type_elo']
+                                                  , bins=9
+                                                  , labels=[1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+# some stats for the classes
+portrait_elo_status_data_df["elo_weight"] = - portrait_elo_status_data_df["behavioral_elo_delta"] / (
+        (adjustment_factor_ELO + adjustment_factor_MOV) * portrait_elo_status_data_df["action_count"])
+portrait_elo_status_data_df["mean_percentage"] = portrait_elo_status_data_df["sum_of_percentages"] / portrait_elo_status_data_df["action_count"]
+portrait_elo_status_data_df["elo_weight_factor"] = (100 - portrait_elo_status_data_df["mean_percentage"]) / 100
+portrait_elo_status_data_df["elo_weight_factor"].fillna(portrait_elo_status_data_df["elo_weight_factor"].mean())
+portrait_elo_status_data = portrait_elo_status_data_df.to_dict('records')
+
+portrait_elo_status_data_df["elo_due_to_others"] = portrait_elo_status_data_df["element_type_elo"] + portrait_elo_status_data_df["behavioral_elo_delta"]
+
+production_key = os.getenv('PRODUCTION_KEY')
+production_url = os.getenv('PRODUCTION_URL')
+
+portrait_elo_status_chunks = np.array_split(portrait_elo_status_data_df, 90)
+
+for x in range(0, len(portrait_elo_status_chunks)):
+    uuid = portrait_elo_status_chunks[x]['uuid']
+    optic_elo_score = portrait_elo_status_chunks[x]['element_type_elo']
+    optic_elo_class = portrait_elo_status_chunks[x]['elo_class']
+
+    body = {
+        "api_key": str(production_key),
+        "values":
+          [
+             dict(zip(["uuid", "optic_elo_score", "optic_elo_class"], [uuid, score, o_class])) for uuid, score, o_class in zip(uuid, optic_elo_score, optic_elo_class)
+        ]
+    }
+    headers = {"Content-Type": "application/json"}
+
+    resp = requests.put(url=production_url, data=json.dumps(body), headers=headers)
+    print(resp.text)
+
+print('elo_analysis_main.py done')
